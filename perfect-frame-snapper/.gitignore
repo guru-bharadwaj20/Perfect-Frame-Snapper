@@ -1,4 +1,5 @@
 venv/
+models/
 output/*.jpg
 output/*.png
 __pycache__/
