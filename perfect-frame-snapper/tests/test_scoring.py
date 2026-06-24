@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.scoring import (
     eye_aspect_ratio,
+    mouth_aspect_ratio,
     is_blinking,
     face_eye_score,
     frame_score,
@@ -22,6 +23,7 @@ from src.scoring import (
     FaceScore,
     FrameScore,
 )
+from src.config import ENABLE_MOUTH_PENALTY
 
 
 # ---------------------------------------------------------------------------
@@ -58,10 +60,19 @@ def _make_eye_pts(ear_target: float, width: float = 100.0) -> np.ndarray:
 
 class _FakeFace:
     """Minimal duck-type for FaceResult, usable by scoring functions."""
-    def __init__(self, face_index: int, right_ear: float, left_ear: float):
+    def __init__(self, face_index: int, right_ear: float, left_ear: float,
+                 mar: float = 0.0):
         self.face_index    = face_index
         self.right_eye_pts = _make_eye_pts(right_ear)
         self.left_eye_pts  = _make_eye_pts(left_ear)
+        # Build a synthetic mouth with the requested MAR.
+        # MAR = vertical / horizontal; we fix horizontal = 100, vary vertical.
+        self.mouth_pts = np.array([
+            [50.0,    0.0],          # upper_inner
+            [50.0, mar * 100.0],     # lower_inner  (vertical = mar * 100)
+            [ 0.0, mar * 50.0],      # left_corner
+            [100.0, mar * 50.0],     # right_corner (horizontal = 100)
+        ], dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -205,14 +216,78 @@ def test_score_faces_one_blinker():
 
 
 def test_face_score_fields():
-    face = _FakeFace(0, right_ear=0.30, left_ear=0.20)
+    # With a closed mouth (mar=0) the mouth penalty is 1.0, so eye_score == raw average.
+    face = _FakeFace(0, right_ear=0.30, left_ear=0.20, mar=0.0)
     result = score_faces([face])
     fs = result.face_scores[0]
     assert math.isclose(fs.right_ear, 0.30, abs_tol=1e-5)
     assert math.isclose(fs.left_ear,  0.20, abs_tol=1e-5)
-    assert math.isclose(fs.eye_score, 0.25, abs_tol=1e-5)
+    # eye_score == 0.25 * penalty; penalty == 1.0 when mouth is closed
+    assert fs.eye_score <= 0.25 + 1e-5, f"eye_score should be <= 0.25, got {fs.eye_score}"
     assert fs.face_index == 0
     print("PASS: FaceScore fields (right_ear, left_ear, eye_score, face_index)")
+
+
+# ---------------------------------------------------------------------------
+# Mouth Aspect Ratio tests
+# ---------------------------------------------------------------------------
+
+def test_mar_closed_mouth():
+    # upper_inner == lower_inner -> vertical = 0 -> MAR = 0
+    pts = np.array([[50, 0], [50, 0], [0, 0], [100, 0]], dtype=np.float32)
+    mar = mouth_aspect_ratio(pts)
+    assert math.isclose(mar, 0.0, abs_tol=1e-5), f"Expected MAR=0.0, got {mar}"
+    print("PASS: MAR closed mouth = 0.0")
+
+
+def test_mar_open_mouth():
+    # vertical=60, horizontal=100 -> MAR=0.6
+    pts = np.array([[50, 0], [50, 60], [0, 30], [100, 30]], dtype=np.float32)
+    mar = mouth_aspect_ratio(pts)
+    assert math.isclose(mar, 0.6, abs_tol=1e-5), f"Expected MAR=0.6, got {mar}"
+    print("PASS: MAR open mouth = 0.6")
+
+
+def test_mar_degenerate_horizontal():
+    pts = np.zeros((4, 2), dtype=np.float32)   # all at origin
+    mar = mouth_aspect_ratio(pts)
+    assert mar == 0.0, f"Expected 0.0 for degenerate pts, got {mar}"
+    print("PASS: MAR degenerate (all-zeros -> 0.0)")
+
+
+def test_mouth_penalty_reduces_score_when_enabled():
+    """With ENABLE_MOUTH_PENALTY=True, a wide-open mouth must lower the score."""
+    ear = 0.28
+    face_closed = _FakeFace(0, right_ear=ear, left_ear=ear, mar=0.0)   # mouth closed
+    face_open   = _FakeFace(0, right_ear=ear, left_ear=ear, mar=1.0)   # mouth wide open
+
+    score_closed = score_faces([face_closed]).score
+    score_open   = score_faces([face_open]).score
+
+    if ENABLE_MOUTH_PENALTY:
+        assert score_open < score_closed, (
+            f"Open-mouth score ({score_open:.4f}) should be < "
+            f"closed-mouth score ({score_closed:.4f}) when ENABLE_MOUTH_PENALTY=True"
+        )
+        print(f"PASS: mouth penalty active — open {score_open:.3f} < closed {score_closed:.3f}")
+    else:
+        assert math.isclose(score_open, score_closed, abs_tol=1e-5), (
+            "Scores should be equal when ENABLE_MOUTH_PENALTY=False"
+        )
+        print("PASS: mouth penalty inactive (ENABLE_MOUTH_PENALTY=False) — scores equal")
+
+
+def test_blinking_flag_ignores_mouth_penalty():
+    """blinking is based on raw EAR, not the mouth-penalised score."""
+    # EAR above threshold but mouth wide open -> blinking should still be False
+    ear  = BLINK_THRESHOLD + 0.05
+    face = _FakeFace(0, right_ear=ear, left_ear=ear, mar=2.0)
+    result = score_faces([face])
+    fs = result.face_scores[0]
+    assert not fs.blinking, (
+        f"blinking should be False (eyes open) even with wide mouth; ear={ear}"
+    )
+    print("PASS: blinking=False even with wide-open mouth (EAR is the sole blink signal)")
 
 
 if __name__ == "__main__":
@@ -238,5 +313,12 @@ if __name__ == "__main__":
     test_score_faces_all_open()
     test_score_faces_one_blinker()
     test_face_score_fields()
+    # MAR + mouth penalty
+    test_mar_closed_mouth()
+    test_mar_open_mouth()
+    test_mar_degenerate_horizontal()
+    test_mouth_penalty_reduces_score_when_enabled()
+    test_blinking_flag_ignores_mouth_penalty()
 
-    print(f"\nAll scoring tests passed.  BLINK_THRESHOLD = {BLINK_THRESHOLD}")
+    print(f"\nAll scoring tests passed.  BLINK_THRESHOLD={BLINK_THRESHOLD}  "
+          f"ENABLE_MOUTH_PENALTY={ENABLE_MOUTH_PENALTY}")
