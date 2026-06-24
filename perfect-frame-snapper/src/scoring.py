@@ -13,10 +13,12 @@ MAR (Mouth Aspect Ratio) — penalises wide-open mid-speech mouths:
     MAR = ||upper_inner - lower_inner|| / ||left_corner - right_corner||
     penalty_factor = max(0.70, 1.0 - 0.30 * max(0, MAR - MOUTH_OPEN_THRESHOLD))
 
-Public API (consumed by main.py):
+Public API (consumed by main.py and gui.py):
 
     faces  = detector.detect(frame)     # list[FaceResult]
-    result = score_faces(faces)         # FrameScore
+    result = score_faces(faces)         # FrameScore — uses config defaults
+    # GUI can override thresholds live:
+    result = score_faces(faces, blink_threshold=0.22, enable_mouth_penalty=False)
     print(result.score, result.has_blinker)
 """
 
@@ -151,20 +153,29 @@ def _mouth_penalty_factor(mar: float) -> float:
 # Rich scoring entry point
 # ---------------------------------------------------------------------------
 
-def score_faces(faces: list) -> FrameScore:
+def score_faces(
+    faces: list,
+    blink_threshold: float = BLINK_THRESHOLD,
+    enable_mouth_penalty: bool = ENABLE_MOUTH_PENALTY,
+) -> FrameScore:
     """Score every face in a frame and return a structured FrameScore.
 
     Pipeline per face:
       1. Compute right_ear and left_ear via eye_aspect_ratio().
       2. raw_avg = (right_ear + left_ear) / 2
-      3. If ENABLE_MOUTH_PENALTY: apply _mouth_penalty_factor(MAR) to raw_avg.
-      4. blinking = raw_avg < BLINK_THRESHOLD  (based on eyes only, not mouth).
+      3. If enable_mouth_penalty: apply _mouth_penalty_factor(MAR) to raw_avg.
+      4. blinking = raw_avg < blink_threshold  (based on eyes only, not mouth).
       5. eye_score = penalised score stored in FaceScore.
 
     Frame score = min(eye_score) across all faces; 0.0 on empty input.
 
     Args:
-        faces: list[FaceResult] from detector.FaceDetector.detect().
+        faces:                list[FaceResult] from detector.FaceDetector.detect().
+        blink_threshold:      EAR below this marks a face as blinking.
+                              Defaults to BLINK_THRESHOLD from config.py.
+                              The GUI passes its live slider value here.
+        enable_mouth_penalty: Whether to apply the mouth-open penalty.
+                              Defaults to ENABLE_MOUTH_PENALTY from config.py.
 
     Returns:
         FrameScore with .score, .has_blinker, and .face_scores populated.
@@ -178,7 +189,7 @@ def score_faces(faces: list) -> FrameScore:
         l_ear   = eye_aspect_ratio(face.left_eye_pts)
         raw_avg = (r_ear + l_ear) * 0.5
 
-        if ENABLE_MOUTH_PENALTY:
+        if enable_mouth_penalty:
             mar     = mouth_aspect_ratio(face.mouth_pts)
             penalty = _mouth_penalty_factor(mar)
         else:
@@ -191,7 +202,7 @@ def score_faces(faces: list) -> FrameScore:
             right_ear=r_ear,
             left_ear=l_ear,
             eye_score=eye_score,
-            blinking=is_blinking(raw_avg),   # based on eyes only, not mouth
+            blinking=raw_avg < blink_threshold,   # based on eyes only, not mouth
         ))
 
     best_score  = min(fs.eye_score for fs in face_scores)

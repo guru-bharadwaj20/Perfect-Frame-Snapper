@@ -1,22 +1,10 @@
 # Perfect-Frame Auto-Snapper
 
 Continuously buffers the last few seconds of webcam footage and retroactively
-saves the single best frame — the one where everyone in shot has their eyes
+saves the **single best frame** — the one where everyone in shot has their eyes
 fully open and nobody is mid-blink or mid-word.
 
-## How it works
-
-A rolling deque keeps ~90 frames (~3 s) in memory.  Every frame is scored
-using the Eye Aspect Ratio (EAR) derived from MediaPipe face landmarks.
-When a save fires (manually or automatically), the tool scans the buffer and
-writes the highest-scoring frame to `output/` as a timestamped JPEG.
-
-**EAR** measures how open each eye is (higher = more open).  A blink dips
-below `BLINK_THRESHOLD` (default 0.20).  The frame score is the *minimum*
-EAR across all detected faces — one blinker tanks the whole frame.
-
-An optional **mouth penalty** reduces the score slightly when anyone's mouth
-is wide open (MAR > `MOUTH_OPEN_THRESHOLD`), helping avoid mid-speech frames.
+No manual timing. No burst-mode sifting. One great photo, automatically.
 
 ---
 
@@ -31,12 +19,69 @@ venv\Scripts\activate          # Windows
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Run
+# 3. Launch the GUI  ← recommended for everyday use
+python run.py
+
+# 4. Or run the headless CLI
 python -m src.main
 ```
 
-On first run, the MediaPipe Face Landmarker model (~10 MB) is downloaded
-automatically to `models/` and cached for future sessions.
+On first run, the MediaPipe Face Landmarker model (~10 MB) downloads
+automatically to `models/` and is cached for every future session.
+
+---
+
+## How it works
+
+### Scoring pipeline
+
+```
+Webcam frame (BGR)
+        │
+        ▼
+MediaPipe Face Landmarker  ──  478 landmarks per detected face
+        │
+        ▼  for each detected face:
+┌───────────────────────────────────────────────────────────────┐
+│  6 right-eye landmarks  →  EAR_right ──┐                      │
+│  6 left-eye landmarks   →  EAR_left   ─┴──→  raw_avg          │
+│                                                   │            │
+│  4 mouth landmarks  →  MAR  →  penalty ───────────×           │
+│                                (if mouth penalty on)  │        │
+│                                                       ▼        │
+│                                               eye_score        │
+└───────────────────────────────────────────────────────────────┘
+        │
+        ▼
+Frame score = min(eye_score) across all detected faces
+              ↑
+    One blinker tanks the whole frame — 0.0 if no faces visible
+```
+
+**EAR** (Eye Aspect Ratio) measures how open each eye is.
+A blink dips below `BLINK_THRESHOLD` (default 0.20).
+
+**MAR** (Mouth Aspect Ratio) optionally penalises wide-open mouths (mid-speech)
+by up to 30%, capped so the minimum per-face contribution is 0.70 × raw_avg.
+
+### Module structure
+
+```
+src/config.py   ← all tunables; edit this file to change behaviour
+    ▲  ▲  ▲  ▲
+    │  │  │  └── src/capture.py   webcam loop, rolling frame buffer
+    │  │  └───── src/detector.py  MediaPipe wrapper → list[FaceResult]
+    │  └──────── src/scoring.py   EAR + MAR scoring → FrameScore
+    │                 ▲
+    └── src/overlay.py            OpenCV drawing helpers (shared)
+              ▲            ▲
+        src/main.py   src/gui.py
+         (CLI mode)   (GUI mode)
+              │            │
+              └─────┬──────┘
+                    ▼
+            output/snap_*.jpg
+```
 
 ---
 
@@ -44,23 +89,124 @@ automatically to `models/` and cached for future sessions.
 
 ### Manual mode (default)
 
-Press **SPACE** to fire the shutter.  After the keypress the tool buffers
-for an extra `POST_TRIGGER_SECONDS` (default 1 s) to catch a slightly-later
-good moment, then saves the best frame from the full window.
+```
+Webcam ──→ Detect ──→ Score ──→ Rolling buffer (last 90 frames, ~3 s)
+                                           │
+                               Press SPACE / Snap button
+                                           │
+                      POST_TRIGGER_SECONDS > 0? ──yes──→ Keep buffering N s
+                                           │                      │
+                                          no               Deadline passes
+                                           │                      │
+                                           └──────────────────────┘
+                                                         │
+                                             Scan buffer → best frame
+                                                         │
+                                                         ▼
+                                               output/snap_*.jpg
+```
 
-Set `POST_TRIGGER_SECONDS = 0` in `config.py` for pure pre-trigger behaviour
-(saves from the buffer that existed at the moment you pressed the key).
+Press **SPACE** (or the Snap button in the GUI) to fire the shutter.
+The tool reaches back through the buffer and saves the highest-scoring frame.
 
-### Auto-snap mode
+With `POST_TRIGGER_SECONDS > 0` (default 1 s) the buffer keeps filling for
+that extra window after the keypress, so you can snap *before* everyone is
+fully composed and still catch the great moment that follows.
 
-Toggle with **A**.  The tool watches for a sustained high-quality moment —
-`AUTO_SNAP_STABLE_FRAMES` consecutive frames all above `AUTO_SNAP_THRESHOLD`
-(default 8 frames ≈ 0.27 s, threshold 0.26).  When that condition holds, it
-saves the best frame of that window, then waits `AUTO_SNAP_COOLDOWN` seconds
-(default 5 s) before it can fire again.
+Set `POST_TRIGGER_SECONDS = 0` for pure pre-trigger (saves whatever is in the
+buffer at the instant you press the key).
 
-This avoids spamming duplicate saves: a single good moment produces one snap,
-and the cooldown prevents rapid re-fires.
+### Auto-snap mode  (toggle with **A** or the mode button)
+
+```
+Webcam ──→ Detect ──→ Score
+                         │
+              score ≥ AUTO_SNAP_THRESHOLD? ───no──→ reset consecutive counter
+                         │
+                        yes
+                         │
+              consecutive_good_frames++
+                         │
+     consecutive_good_frames ≥ AUTO_SNAP_STABLE_FRAMES (default 8)?
+                         │
+                        yes  AND  cooldown timer expired?
+                         │
+                         ▼
+         Save best of the last 8 frames  →  output/snap_*.jpg
+         Reset counter; start cooldown (AUTO_SNAP_COOLDOWN s)
+```
+
+The tool watches continuously and saves automatically when it sees a sustained
+high-quality moment — `AUTO_SNAP_STABLE_FRAMES` consecutive frames (default 8,
+≈ 0.25 s at 30 fps) all above `AUTO_SNAP_THRESHOLD` (default 0.26).
+
+The **stable-frame gate** prevents transient spikes from firing a save.
+The **cooldown** (default 5 s) prevents duplicate saves of the same moment.
+
+---
+
+## GUI guide
+
+```
+┌─ Perfect-Frame Auto-Snapper ─────────────────────────────────────────────┐
+│                                          │                                │
+│   ┌──────────────────────────────────┐  │  SCORE: 0.287  (green/red)     │
+│   │                                  │  │  faces: 1   buf: 87/90          │
+│   │   Live webcam feed (640×480)     │  ├──────────────────────────────  │
+│   │   with all Phase 5 overlays      │  │  [Snap [SPACE]]  [AUTO: OFF]    │
+│   │                                  │  ├──────────────────────────────  │
+│   │   • SCORE top-centre             │  │  Blink threshold     0.20  ──  │
+│   │   • MANUAL / AUTO badge          │  │  Auto-snap threshold 0.26  ──  │
+│   │   • Per-face #N score [OPEN]     │  │  Auto-snap cooldown  5.0s  ──  │
+│   │   • Cyan / magenta eye dots      │  │  Post-trigger window 1.0s  ──  │
+│   │   • Green/red history strip      │  │  ☑ Mouth penalty               │
+│   │   • Post-trigger countdown       │  ├──────────────────────────────  │
+│   │   • Flash banner on save         │  │  Last saved:                   │
+│   │                                  │  │  ┌──────────┐  snap_…jpg       │
+│   └──────────────────────────────────┘  │  │ thumbnail│  Score: 0.312    │
+│                                          │  └──────────┘                  │
+│                                          │  [Open output folder]          │
+│                                          ├──────────────────────────────  │
+│                                          │  Frames: 1,234  Snaps: 3       │
+│                                          │  [Quit  [Q / ESC]]             │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### GUI controls reference
+
+| Control | What it does |
+|---|---|
+| **Snap [SPACE]** | Fire the manual shutter (greyed out in auto mode) |
+| **AUTO: OFF / ON** | Toggle auto-snap mode |
+| **Blink threshold** slider | EAR below this = blinking; also controls overlay colours |
+| **Auto-snap threshold** slider | Minimum score for an auto-snap candidate frame |
+| **Auto-snap cooldown** slider | Seconds of silence after each auto-snap |
+| **Post-trigger window** slider | Extra seconds to buffer after SPACE; 0 = pure pre-trigger |
+| **Mouth penalty** checkbox | Penalise frames where someone's mouth is wide open |
+| **Open output folder** | Opens `output/` in Explorer / Finder |
+| **Quit [Q / ESC]** | Releases camera, prints session summary, closes window |
+
+Slider changes take effect **immediately** — no restart needed.
+
+---
+
+## CLI mode
+
+The original headless interface is still fully functional:
+
+```bash
+python -m src.main
+```
+
+All keyboard shortcuts work the same way in both modes.
+
+### Controls (CLI and GUI)
+
+| Key | Action |
+|---|---|
+| **SPACE** | Fire manual snap |
+| **A** | Toggle auto-snap mode on / off |
+| **Q** or **ESC** | Quit and print session summary |
 
 ---
 
@@ -68,70 +214,62 @@ and the cooldown prevents rapid re-fires.
 
 | Element | What it shows |
 |---|---|
-| **SCORE: 0.287** (top centre) | Live frame score — green >= threshold, red below |
-| **MANUAL / AUTO [###---]** (top right) | Current mode; in auto, `#` fill shows stable-frame progress |
+| **SCORE: 0.287** (top centre) | Live frame score — green ≥ threshold, red below |
+| **MANUAL / AUTO [###---]** (top right) | Current mode; `#` fill shows stable-frame progress |
 | **#0 0.28 [OPEN]** (near each face) | Per-face eye score and blink status |
-| Cyan dots | Right-eye EAR landmarks |
-| Magenta dots | Left-eye EAR landmarks |
+| Cyan dots | Right-eye EAR landmarks (6 per face) |
+| Magenta dots | Left-eye EAR landmarks (6 per face) |
 | Coloured strip (near bottom) | Rolling score history — green/red per frame |
-| Post-trigger countdown | Shown in orange while the post-trigger window is open |
-| Flash banner (centre) | Save confirmation ("Saved: snap_….jpg") or error |
+| Orange countdown text | Visible while the post-trigger window is open |
+| Flash banner (centre) | Save confirmation ("Saved: snap_….jpg  score=0.312") or error |
 | Footer | Context-sensitive control hints |
-
----
-
-## Controls
-
-| Key | Action |
-|---|---|
-| **SPACE** | Fire manual snap (inactive in auto mode) |
-| **A** | Toggle auto-snap mode on / off |
-| **Q** or **ESC** | Quit and print session summary |
 
 ---
 
 ## Configuration — `src/config.py`
 
-All tunables are in one file.  The most commonly changed ones:
+All tunables live in one file. Change them for a persistent effect; use the
+GUI sliders for live, per-session adjustments.
 
 | Constant | Default | What it does |
 |---|---|---|
+| `CAMERA_INDEX` | `0` | Webcam index — increment for non-default cameras |
 | `BUFFER_SIZE` | `90` | Rolling window size in frames (~3 s at 30 fps) |
-| `CAMERA_INDEX` | `0` | Webcam index (increment for non-default cameras) |
-| `OUTPUT_DIR` | `output/` | Where JPEGs are saved |
-| `BLINK_THRESHOLD` | `0.20` | EAR below this = blinking.  Raise if you get false-positives |
+| `OUTPUT_DIR` | `output/` | Where timestamped JPEGs are saved |
+| `BLINK_THRESHOLD` | `0.20` | EAR below this = blinking. Raise if you get false-positives |
 | `ENABLE_MOUTH_PENALTY` | `True` | Penalise wide-open mouths (mid-speech) |
 | `MOUTH_OPEN_THRESHOLD` | `0.50` | MAR above this triggers the penalty |
-| `POST_TRIGGER_SECONDS` | `1.0` | Extra buffering after SPACE.  `0` = pure pre-trigger |
+| `MAX_NUM_FACES` | `8` | Maximum faces tracked simultaneously |
+| `POST_TRIGGER_SECONDS` | `1.0` | Extra buffer time after SPACE. `0` = pure pre-trigger |
 | `AUTO_SNAP_MODE` | `False` | Start in auto mode instead of manual |
 | `AUTO_SNAP_THRESHOLD` | `0.26` | Score required for an auto-snap candidate |
 | `AUTO_SNAP_STABLE_FRAMES` | `8` | Consecutive good frames before auto-firing |
 | `AUTO_SNAP_COOLDOWN` | `5.0` | Seconds between auto-snaps |
-| `KEY_SHUTTER` | `ord(" ")` | Spacebar |
-| `KEY_TOGGLE_AUTO` | `ord("a")` | A key |
+| `FLASH_SECONDS` | `2.0` | How long the save-confirmation banner stays on screen |
+| `SCORE_HISTORY_N` | `90` | Width of the rolling history strip |
 
 ---
 
 ## Testing
 
 ```bash
-# Phase 1 — webcam smoke test
-python tests/test_webcam.py
+# All tests are headless — no webcam, no display required (except test_webcam.py)
 
-# Phase 2 — detector smoke test (headless)
-python tests/test_detector.py
-
-# Phase 3 — scoring unit tests (headless)
+# Unit tests: scoring logic (23 tests)
 python tests/test_scoring.py
 
-# Phase 4 — save-logic tests (headless)
+# Unit tests: save / buffer logic (6 tests)
 python tests/test_main.py
 
-# Phase 2 debug — live landmark overlay
-python src/detector.py
+# Smoke tests: detector init + shape contracts (5 tests, loads MediaPipe)
+python tests/test_detector.py
 
-# Phase 3 debug — live scoring overlay
-python src/scoring.py
+# Integration test: opens the webcam and captures 30 frames
+python tests/test_webcam.py
+
+# Debug previews (live overlays in an OpenCV window, press Q to quit)
+python src/detector.py    # raw landmark overlay
+python src/scoring.py     # EAR scores + blink state
 ```
 
 ---
@@ -140,21 +278,50 @@ python src/scoring.py
 
 ```
 perfect-frame-snapper/
+├── run.py              ← one-command launcher: python run.py
+├── requirements.txt
 ├── src/
-│   ├── config.py       # All tunables — edit this file to change behaviour
-│   ├── capture.py      # Webcam loop + raw rolling buffer
-│   ├── detector.py     # MediaPipe Face Landmarker wrapper -> list[FaceResult]
-│   ├── scoring.py      # EAR + MAR scoring -> FrameScore
-│   └── main.py         # Orchestrator: manual + auto-snap modes, overlay, save
-├── models/             # Downloaded MediaPipe model (gitignored)
-├── output/             # Saved best-frame JPEGs (gitignored)
-├── tests/
-│   ├── test_webcam.py
-│   ├── test_detector.py
-│   ├── test_scoring.py
-│   └── test_main.py
-└── requirements.txt
+│   ├── config.py       ← all tunables — change here for persistent effect
+│   ├── capture.py      ← webcam loop + rolling frame buffer
+│   ├── detector.py     ← MediaPipe Face Landmarker wrapper → list[FaceResult]
+│   ├── scoring.py      ← EAR + MAR scoring → FrameScore
+│   ├── overlay.py      ← OpenCV drawing helpers (shared by main + gui)
+│   ├── main.py         ← headless CLI orchestrator
+│   └── gui.py          ← Tkinter GUI (live sliders, thumbnail gallery)
+├── models/             ← face_landmarker.task (~10 MB, downloaded on first run)
+├── output/             ← saved snap_YYYYMMDD_HHMMSS.jpg files
+└── tests/
+    ├── test_webcam.py
+    ├── test_detector.py
+    ├── test_scoring.py
+    └── test_main.py
 ```
+
+---
+
+## Optional packaging — PyInstaller
+
+To distribute the app as a standalone `.exe` (no Python or venv required):
+
+```bash
+pip install pyinstaller
+
+pyinstaller --onefile --windowed \
+  --add-data "models/face_landmarker.task;models" \
+  --hidden-import mediapipe \
+  --hidden-import PIL._tkinter_finder \
+  run.py
+```
+
+The result appears in `dist/run.exe`.
+
+**Caveats:**
+- The bundled binary is typically 200–400 MB due to MediaPipe and OpenCV.
+- `--windowed` suppresses the terminal on Windows; remove it to keep the
+  session-summary output visible in a console window.
+- The `--add-data` flag bundles the model file so the download step is skipped
+  at runtime. Use `;` as separator on Windows, `:` on macOS/Linux.
+- Test the packaged binary on a machine without Python installed before sharing.
 
 ---
 
@@ -163,7 +330,9 @@ perfect-frame-snapper/
 | Package | Version | Role |
 |---|---|---|
 | `opencv-python` | 4.13.0.92 | Webcam capture, image I/O, overlay drawing |
-| `mediapipe` | 0.10.35 | Face Landmarker model (478 landmarks) |
+| `mediapipe` | 0.10.35 | Face Landmarker model (478 landmarks, Tasks API) |
 | `numpy` | 2.5.0 | Array ops for EAR / MAR geometry |
+| `Pillow` | ≥ 9.0 | OpenCV BGR frame → Tkinter PhotoImage conversion (GUI only) |
 
-Python 3.9 – 3.13 supported.
+Python 3.9–3.13 supported.  Pillow is a transitive dependency of MediaPipe and
+is present in the venv automatically; it is listed explicitly for clarity.
