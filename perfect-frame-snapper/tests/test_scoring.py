@@ -290,6 +290,17 @@ def test_blinking_flag_ignores_mouth_penalty():
     print("PASS: blinking=False even with wide-open mouth (EAR is the sole blink signal)")
 
 
+def test_score_faces_custom_blink_threshold():
+    """score_faces respects the blink_threshold parameter (used by GUI sliders)."""
+    # EAR 0.22 is above 0.20 (open) but below 0.25 (blinking)
+    face = _FakeFace(0, right_ear=0.22, left_ear=0.22, mar=0.0)
+    res_low  = score_faces([face], blink_threshold=0.20)
+    res_high = score_faces([face], blink_threshold=0.25)
+    assert not res_low.face_scores[0].blinking,  "EAR 0.22 >= 0.20 should be open"
+    assert     res_high.face_scores[0].blinking, "EAR 0.22 <  0.25 should be blinking"
+    print("PASS: score_faces respects custom blink_threshold parameter")
+
+
 if __name__ == "__main__":
     # EAR
     test_ear_wide_open()
@@ -319,6 +330,7 @@ if __name__ == "__main__":
     test_mar_degenerate_horizontal()
     test_mouth_penalty_reduces_score_when_enabled()
     test_blinking_flag_ignores_mouth_penalty()
+    test_score_faces_custom_blink_threshold()
 
     print(f"\nAll scoring tests passed.  BLINK_THRESHOLD={BLINK_THRESHOLD}  "
           f"ENABLE_MOUTH_PENALTY={ENABLE_MOUTH_PENALTY}")
