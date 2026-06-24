@@ -75,8 +75,17 @@ def _ensure_model() -> Path:
 RIGHT_EYE_IDX: list[int] = [33, 160, 158, 133, 153, 144]
 LEFT_EYE_IDX:  list[int] = [362, 385, 387, 263, 373, 380]
 
+# Mouth points for the Mouth Aspect Ratio (MAR) mid-speech penalty.
+# Ordered as: [upper_inner, lower_inner, left_corner, right_corner]
+# MAR = ||upper_inner - lower_inner|| / ||left_corner - right_corner||
+MOUTH_IDX: list[int] = [13, 14, 61, 291]
+#  13  -> upper inner lip centre
+#  14  -> lower inner lip centre
+#  61  -> left mouth corner
+# 291  -> right mouth corner
+
 # Minimum landmark count required before indexing is safe.
-_MIN_LANDMARKS = max(max(RIGHT_EYE_IDX), max(LEFT_EYE_IDX)) + 1
+_MIN_LANDMARKS = max(max(RIGHT_EYE_IDX), max(LEFT_EYE_IDX), max(MOUTH_IDX)) + 1
 
 # Debug overlay colours (BGR)
 _CLR_RIGHT = (0, 255, 255)    # cyan
@@ -90,16 +99,18 @@ _CLR_TEXT  = (255, 255, 255)  # white
 
 @dataclass
 class FaceResult:
-    """Detected face with pre-extracted eye landmark pixel coordinates.
+    """Detected face with pre-extracted landmark pixel coordinates.
 
     Attributes:
         face_index:    Position in the list returned by detect() (0-based).
         right_eye_pts: (6, 2) float32 array — pixel (x, y) in RIGHT_EYE_IDX order.
         left_eye_pts:  (6, 2) float32 array — pixel (x, y) in LEFT_EYE_IDX order.
+        mouth_pts:     (4, 2) float32 array — pixel (x, y) in MOUTH_IDX order.
     """
     face_index:    int
     right_eye_pts: np.ndarray   # shape (6, 2)
     left_eye_pts:  np.ndarray   # shape (6, 2)
+    mouth_pts:     np.ndarray   # shape (4, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -182,12 +193,14 @@ class FaceDetector:
         for idx, face_lms in enumerate(mp_result.face_landmarks):
             if len(face_lms) < _MIN_LANDMARKS:
                 continue  # incomplete landmark set — skip rather than crash
-            right_pts = _extract_pts(face_lms, RIGHT_EYE_IDX, w, h)
-            left_pts  = _extract_pts(face_lms, LEFT_EYE_IDX,  w, h)
+            right_pts  = _extract_pts(face_lms, RIGHT_EYE_IDX, w, h)
+            left_pts   = _extract_pts(face_lms, LEFT_EYE_IDX,  w, h)
+            mouth_pts  = _extract_pts(face_lms, MOUTH_IDX,     w, h)
             results.append(FaceResult(
                 face_index=idx,
                 right_eye_pts=right_pts,
                 left_eye_pts=left_pts,
+                mouth_pts=mouth_pts,
             ))
 
         return results
