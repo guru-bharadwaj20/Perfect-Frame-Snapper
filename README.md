@@ -250,15 +250,21 @@ GUI sliders for live, per-session adjustments.
 
 ### Advanced / opt-in features (all default to OFF)
 
-The constants below are all `False` by default so the app behaves exactly as
-before when you haven't set them.  Enable one or more in `src/config.py` for
-the corresponding upgrade.
+Features 2–4 below are controlled by boolean flags in `src/config.py` that
+default to `False`, so the app behaves exactly as before when you haven't
+touched them.  Feature 1 (calibration) is activated by running `--calibrate`
+once; no config flag is required.
 
 #### Feature 1 — Per-user adaptive threshold calibration
 
-| Constant | Default | What it does |
+This feature is **activated by running `--calibrate` once** (CLI) or clicking
+the Calibrate button (GUI), not by a config flag.  The result is stored
+automatically; no `src/config.py` change is needed.
+
+| Item | Value | Notes |
 |---|---|---|
-| `CALIBRATION_FILE` | `calibration.json` | JSON file storing personalised EAR baseline + threshold |
+| `CALIBRATION_FILE` | `calibration.json` (project root) | Written by `--calibrate`; loaded on every subsequent launch |
+| To disable | — | Delete `calibration.json` to revert to the static `BLINK_THRESHOLD` |
 
 **How to use (CLI):**
 

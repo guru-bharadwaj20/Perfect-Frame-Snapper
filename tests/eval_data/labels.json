@@ -2,6 +2,26 @@
   {
     "clip": "clip_001",
     "best_frame": 1,
-    "note": "Sample entry — replace best_frame with the 1-based index of the human-labelled best frame in clip_001/"
+    "note": "Synthetic solid-grey single frame. No faces -- score is 0.0 with default or composite evaluation. Used as smoke-test only."
+  },
+  {
+    "clip": "clip_002",
+    "best_frame": 8,
+    "note": "Synthetic 15-frame clip. Frame 8 is random noise (high Laplacian variance); all others are solid grey or blurred. Correct result with --composite; trivially 0.0 without."
+  },
+  {
+    "clip": "clip_003",
+    "best_frame": 20,
+    "note": "Synthetic 25-frame clip. Frame 20 is random noise (high Laplacian variance). Correct result with --composite."
+  },
+  {
+    "clip": "clip_004",
+    "best_frame": 3,
+    "note": "Synthetic 10-frame clip. Frame 3 is random noise (high Laplacian variance). Correct result with --composite."
+  },
+  {
+    "clip": "clip_005",
+    "best_frame": 17,
+    "note": "Synthetic 30-frame clip. Frame 17 is random noise (high Laplacian variance). Correct result with --composite."
   }
 ]
