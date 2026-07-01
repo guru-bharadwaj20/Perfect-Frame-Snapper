@@ -67,3 +67,40 @@ SCORE_HISTORY_N = 90    # number of past scores shown in the readiness bar
 KEY_SHUTTER     = ord(" ")         # spacebar — fire manual snap
 KEY_QUIT        = {ord("q"), 27}   # lowercase q or ESC
 KEY_TOGGLE_AUTO = ord("a")         # toggle auto-snap mode on / off
+
+# ── Calibration (Feature 1) ────────────────────────────────────────────────────
+# Path to per-user calibration JSON.  Created by --calibrate (CLI) or the
+# "Calibrate" button (GUI).  Falls back to static BLINK_THRESHOLD when absent.
+# Delete this file to reset to config defaults.
+CALIBRATION_FILE = Path(__file__).parent.parent / "calibration.json"
+
+# ── Composite scoring (Feature 2) ─────────────────────────────────────────────
+# When False (default): frame score = min(eye_score) across all faces.
+# When True: score = weighted blend of eye quality, blur, and head-pose.
+USE_COMPOSITE_SCORING = False
+COMPOSITE_WEIGHT_EYE  = 0.5   # weight for EAR-based eye/mouth score
+COMPOSITE_WEIGHT_BLUR = 0.3   # weight for Laplacian sharpness score
+COMPOSITE_WEIGHT_POSE = 0.2   # weight for head-pose (front-facing) score
+
+# Laplacian variance bounds for blur normalisation.
+# variance < BLUR_MIN_VARIANCE  →  blur_score 0.0 (very blurry)
+# variance > BLUR_MAX_VARIANCE  →  blur_score 1.0 (very sharp)
+BLUR_MIN_VARIANCE = 50.0
+BLUR_MAX_VARIANCE = 500.0
+
+# ── Face weighting (Feature 4) ────────────────────────────────────────────────
+# When False (default): score = min(eye_score) equally across all faces.
+# When True: score = prominence-weighted average, so a small / peripheral
+# blinker has reduced influence on the final frame score.
+USE_FACE_WEIGHTING = False
+FACE_WEIGHT_SIZE   = 0.6   # fraction of prominence from relative face size
+FACE_WEIGHT_CENTER = 0.4   # fraction of prominence from proximity to frame centre
+
+# ── Adaptive learning (Feature 3) ─────────────────────────────────────────────
+# When False (default): AUTO_SNAP_THRESHOLD stays fixed.
+# When True: user Keep / Discard feedback nudges the threshold in memory only
+# (never modifies config.py or the calibration file).
+ENABLE_ADAPTIVE_LEARNING = False
+ADAPTIVE_LEARNING_FILE   = Path(__file__).parent.parent / "feedback_log.json"
+ADAPTIVE_LEARNING_WINDOW = 20    # decisions per adjustment cycle
+ADAPTIVE_LEARNING_STEP   = 0.01  # threshold delta per completed cycle

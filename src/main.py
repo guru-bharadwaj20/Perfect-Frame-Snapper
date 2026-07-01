@@ -44,6 +44,9 @@ from src.config import (
     MIN_FACE_DETECTION_CONFIDENCE,
     MIN_FACE_PRESENCE_CONFIDENCE,
     MIN_TRACKING_CONFIDENCE,
+    CALIBRATION_FILE,
+    USE_COMPOSITE_SCORING,
+    USE_FACE_WEIGHTING,
 )
 
 _WINDOW_TITLE = "Perfect-Frame Snapper  |  SPACE=snap  A=auto  Q/ESC=quit"
@@ -263,9 +266,41 @@ def _draw_footer(
 
 def main() -> None:
     """Launch the Perfect-Frame Auto-Snapper."""
+    import argparse
     from src.capture import FrameBuffer
     from src.detector import FaceDetector
     from src.scoring import BLINK_THRESHOLD, score_faces
+
+    # ── CLI flags ──────────────────────────────────────────────────────────────
+    parser = argparse.ArgumentParser(description="Perfect-Frame Auto-Snapper")
+    parser.add_argument(
+        "--calibrate", action="store_true",
+        help="Run adaptive threshold calibration, save to calibration.json, then exit.",
+    )
+    args = parser.parse_args()
+
+    # ── Load per-user calibration (falls back to BLINK_THRESHOLD when absent) ─
+    from src.calibration import (
+        load_calibration, calibration_blink_threshold, run_calibration,
+        save_calibration,
+    )
+    calib     = load_calibration(CALIBRATION_FILE)
+    blink_thr = calibration_blink_threshold(calib) if calib else BLINK_THRESHOLD
+    if calib:
+        print(f"[Calibration] Loaded — EAR baseline={calib.get('baseline_ear')}, "
+              f"blink threshold={blink_thr:.4f}")
+
+    # ── Calibration mode: run and exit ────────────────────────────────────────
+    if args.calibrate:
+        with FaceDetector(
+            max_num_faces=MAX_NUM_FACES,
+            min_face_detection_confidence=MIN_FACE_DETECTION_CONFIDENCE,
+            min_face_presence_confidence=MIN_FACE_PRESENCE_CONFIDENCE,
+            min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+        ) as det:
+            data = run_calibration(det, camera_index=CAMERA_INDEX)
+        save_calibration(CALIBRATION_FILE, data)
+        return
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -303,9 +338,11 @@ def main() -> None:
     print(f"Perfect-Frame Snapper started  [{'AUTO' if auto_mode else 'MANUAL'} mode]")
     print(f"  Output     : {OUTPUT_DIR.resolve()}")
     print(f"  Buffer     : {BUFFER_SIZE} frames  |  post-trigger: {POST_TRIGGER_SECONDS}s")
-    print(f"  Blink thr  : {BLINK_THRESHOLD}  |  auto threshold: {AUTO_SNAP_THRESHOLD}")
+    print(f"  Blink thr  : {blink_thr:.4f}  |  auto threshold: {AUTO_SNAP_THRESHOLD}")
     print(f"  Auto stable: {AUTO_SNAP_STABLE_FRAMES} frames  |  cooldown: {AUTO_SNAP_COOLDOWN}s")
-    print(f"  SPACE=snap  A=toggle auto  Q/ESC=quit")
+    composite_info = " [COMPOSITE ON]" if USE_COMPOSITE_SCORING else ""
+    weight_info    = " [FACE WEIGHTING ON]" if USE_FACE_WEIGHTING else ""
+    print(f"  SPACE=snap  A=toggle auto  Q/ESC=quit{composite_info}{weight_info}")
 
     buf = FrameBuffer(camera_index=CAMERA_INDEX, maxlen=BUFFER_SIZE)
 
@@ -325,7 +362,13 @@ def main() -> None:
 
                 # ── Detect + score ────────────────────────────────────────────
                 faces  = detector.detect(frame)
-                result = score_faces(faces)
+                result = score_faces(
+                    faces,
+                    blink_threshold=blink_thr,
+                    frame=frame,
+                    use_composite=USE_COMPOSITE_SCORING,
+                    use_face_weighting=USE_FACE_WEIGHTING,
+                )
 
                 scored_buffer.append(ScoredFrame(score=result.score, frame=frame.copy()))
                 score_history.append(result.score)
@@ -360,10 +403,10 @@ def main() -> None:
 
                 # ── Build display ──────────────────────────────────────────────
                 vis = frame.copy()
-                _draw_face_labels(vis, faces, result, BLINK_THRESHOLD)
-                _draw_readiness_bar(vis, score_history, BLINK_THRESHOLD)
+                _draw_face_labels(vis, faces, result, blink_thr)
+                _draw_readiness_bar(vis, score_history, blink_thr)
                 _draw_score_hud(vis, result.score, len(faces),
-                                len(scored_buffer), BUFFER_SIZE, BLINK_THRESHOLD)
+                                len(scored_buffer), BUFFER_SIZE, blink_thr)
                 _draw_mode_badge(vis, auto_mode, auto_consecutive, AUTO_SNAP_STABLE_FRAMES)
                 if post_trigger_until > now:
                     _draw_post_trigger(vis, post_trigger_until - now)

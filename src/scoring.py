@@ -34,7 +34,14 @@ import numpy as np
 # is imported as part of the package or run directly as a script.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.config import BLINK_THRESHOLD, ENABLE_MOUTH_PENALTY, MOUTH_OPEN_THRESHOLD
+from typing import Optional
+
+from src.config import (
+    BLINK_THRESHOLD, ENABLE_MOUTH_PENALTY, MOUTH_OPEN_THRESHOLD,
+    USE_COMPOSITE_SCORING, COMPOSITE_WEIGHT_EYE, COMPOSITE_WEIGHT_BLUR,
+    COMPOSITE_WEIGHT_POSE, BLUR_MIN_VARIANCE, BLUR_MAX_VARIANCE,
+    USE_FACE_WEIGHTING, FACE_WEIGHT_SIZE, FACE_WEIGHT_CENTER,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -64,14 +71,25 @@ class FrameScore:
     """Aggregate quality score for a single frame.
 
     Attributes:
-        face_scores: Per-face breakdown, one entry per detected face.
-        score:       Minimum eye_score across all faces (0.0 if no faces).
-                     One blinker tanks the whole frame.
-        has_blinker: True when any face is currently blinking.
+        face_scores:     Per-face breakdown, one entry per detected face.
+        score:           Primary frame quality score (0.0 if no faces).
+                         When USE_COMPOSITE_SCORING=False (default): min(eye_score).
+                         When USE_COMPOSITE_SCORING=True: weighted composite.
+        has_blinker:     True when any face is currently blinking.
+        blur_score:      Laplacian-variance sharpness in [0, 1]; 1.0 = sharp.
+                         0.0 when frame was not supplied to score_faces().
+        pose_score:      Head-pose front-facing quality in [0, 1]; 1.0 = straight.
+                         0.0 when no faces are detected.
+        composite_score: Weighted blend of eye, blur, and pose scores.
+                         Always computed when frame is supplied; equals score
+                         when USE_COMPOSITE_SCORING=True.
     """
-    face_scores: list[FaceScore] = field(default_factory=list)
-    score:       float = 0.0
-    has_blinker: bool  = False
+    face_scores:     list[FaceScore] = field(default_factory=list)
+    score:           float = 0.0
+    has_blinker:     bool  = False
+    blur_score:      float = 0.0
+    pose_score:      float = 0.0
+    composite_score: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +168,92 @@ def _mouth_penalty_factor(mar: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Feature 2: blur + head-pose helpers
+# ---------------------------------------------------------------------------
+
+def compute_blur_score(frame: np.ndarray) -> float:
+    """Laplacian-variance sharpness score in [0, 1]; 1.0 = very sharp.
+
+    cv2 is imported locally so headless unit tests that never pass a frame
+    can still import scoring.py without requiring a display.
+    """
+    import cv2  # local import — keeps headless tests dependency-free
+    gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+    span     = BLUR_MAX_VARIANCE - BLUR_MIN_VARIANCE + 1e-9
+    return float(max(0.0, min(1.0, (variance - BLUR_MIN_VARIANCE) / span)))
+
+
+def _face_pose_score(face) -> float:
+    """Estimate front-facing quality for one face in [0, 1].
+
+    Combines:
+      • yaw  – eye-width symmetry (min/max ratio of horizontal eye spans)
+      • pitch – eye-to-mouth vertical ratio relative to inter-ocular distance
+
+    Returns 1.0 for a perfectly front-facing face, lower when turned.
+    """
+    r_pts = face.right_eye_pts   # (6, 2)
+    l_pts = face.left_eye_pts    # (6, 2)
+    m_pts = face.mouth_pts       # (4, 2)
+
+    # Yaw: asymmetry in horizontal eye span
+    r_w = abs(float(r_pts[3, 0] - r_pts[0, 0]))   # |P4.x - P1.x| right eye
+    l_w = abs(float(l_pts[0, 0] - l_pts[3, 0]))   # |P1.x - P4.x| left eye
+    max_w = max(r_w, l_w)
+    yaw_score = (min(r_w, l_w) / max_w) if max_w > 1e-6 else 1.0
+
+    # Pitch: eye-to-mouth distance vs inter-ocular distance
+    r_center     = r_pts.mean(axis=0)
+    l_center     = l_pts.mean(axis=0)
+    eye_y        = float(r_center[1] + l_center[1]) * 0.5
+    mouth_y      = float(m_pts[0, 1] + m_pts[1, 1]) * 0.5
+    inter_ocular = abs(float(r_center[0] - l_center[0]))
+
+    if inter_ocular < 1e-6:
+        pitch_score = 1.0
+    else:
+        ratio       = (mouth_y - eye_y) / inter_ocular   # ~0.8 when front-facing
+        pitch_score = max(0.0, 1.0 - abs(ratio - 0.8) / 0.8)
+
+    return float((yaw_score + pitch_score) * 0.5)
+
+
+# ---------------------------------------------------------------------------
+# Feature 4: face prominence weight
+# ---------------------------------------------------------------------------
+
+def face_prominence_weight(face, frame_w: int, frame_h: int) -> float:
+    """Prominence weight for one face based on size and centre proximity.
+
+    Returns a value in (0, 1] where larger and more-centred faces score higher.
+    Used by score_faces() when USE_FACE_WEIGHTING=True.
+
+    Args:
+        face:    A FaceResult (or duck-typed object) with right/left_eye_pts.
+        frame_w: Frame width in pixels.
+        frame_h: Frame height in pixels.
+    """
+    r_center = face.right_eye_pts.mean(axis=0)
+    l_center = face.left_eye_pts.mean(axis=0)
+
+    # Size: inter-ocular distance relative to frame width
+    inter_ocular = float(np.linalg.norm(r_center - l_center))
+    size_score   = min(1.0, inter_ocular / (frame_w * 0.30 + 1e-9))
+
+    # Centre: proximity of face midpoint to frame centre
+    face_cx = float(r_center[0] + l_center[0]) * 0.5
+    face_cy = float(r_center[1] + l_center[1]) * 0.5
+    nx      = face_cx / (frame_w + 1e-9)
+    ny      = face_cy / (frame_h + 1e-9)
+    dist    = float(np.sqrt((nx - 0.5) ** 2 + (ny - 0.5) ** 2))
+    center_score = max(0.0, 1.0 - dist * 2.0)   # 1.0 at centre, ~0 at edges
+
+    weight = FACE_WEIGHT_SIZE * size_score + FACE_WEIGHT_CENTER * center_score
+    return float(max(1e-6, weight))   # never exactly 0 to avoid division issues
+
+
+# ---------------------------------------------------------------------------
 # Rich scoring entry point
 # ---------------------------------------------------------------------------
 
@@ -157,32 +261,44 @@ def score_faces(
     faces: list,
     blink_threshold: float = BLINK_THRESHOLD,
     enable_mouth_penalty: bool = ENABLE_MOUTH_PENALTY,
+    frame: Optional[np.ndarray] = None,
+    use_composite: bool = USE_COMPOSITE_SCORING,
+    use_face_weighting: bool = USE_FACE_WEIGHTING,
 ) -> FrameScore:
     """Score every face in a frame and return a structured FrameScore.
 
-    Pipeline per face:
-      1. Compute right_ear and left_ear via eye_aspect_ratio().
-      2. raw_avg = (right_ear + left_ear) / 2
-      3. If enable_mouth_penalty: apply _mouth_penalty_factor(MAR) to raw_avg.
-      4. blinking = raw_avg < blink_threshold  (based on eyes only, not mouth).
-      5. eye_score = penalised score stored in FaceScore.
+    Existing behaviour (all new params at their defaults):
+      Pipeline per face:
+        1. Compute right_ear and left_ear via eye_aspect_ratio().
+        2. raw_avg = (right_ear + left_ear) / 2
+        3. If enable_mouth_penalty: apply _mouth_penalty_factor(MAR) to raw_avg.
+        4. blinking = raw_avg < blink_threshold  (eyes only, not mouth).
+        5. eye_score = penalised score stored in FaceScore.
+      Frame score = min(eye_score) across all faces; 0.0 on empty input.
 
-    Frame score = min(eye_score) across all faces; 0.0 on empty input.
+    New optional behaviour:
+      frame:             Pass the BGR frame to enable blur scoring and face
+                         weighting by size.  Safe to omit — falls back gracefully.
+      use_composite:     When True, .score = weighted blend of eye, blur, pose.
+      use_face_weighting: When True, .score = prominence-weighted average of
+                         per-face eye_scores instead of min().
 
     Args:
         faces:                list[FaceResult] from detector.FaceDetector.detect().
         blink_threshold:      EAR below this marks a face as blinking.
-                              Defaults to BLINK_THRESHOLD from config.py.
-                              The GUI passes its live slider value here.
         enable_mouth_penalty: Whether to apply the mouth-open penalty.
-                              Defaults to ENABLE_MOUTH_PENALTY from config.py.
+        frame:                Optional BGR frame (enables blur + pose sub-scores).
+        use_composite:        Use composite weighted score as .score.
+        use_face_weighting:   Use prominence-weighted average instead of min().
 
     Returns:
-        FrameScore with .score, .has_blinker, and .face_scores populated.
+        FrameScore with .score, .has_blinker, .face_scores, .blur_score,
+        .pose_score, and .composite_score populated.
     """
     if not faces:
         return FrameScore()
 
+    # ── Per-face scoring (unchanged from original) ────────────────────────────
     face_scores: list[FaceScore] = []
     for face in faces:
         r_ear   = eye_aspect_ratio(face.right_eye_pts)
@@ -196,22 +312,48 @@ def score_faces(
             penalty = 1.0
 
         eye_score = raw_avg * penalty
-
         face_scores.append(FaceScore(
             face_index=face.face_index,
             right_ear=r_ear,
             left_ear=l_ear,
             eye_score=eye_score,
-            blinking=raw_avg < blink_threshold,   # based on eyes only, not mouth
+            blinking=raw_avg < blink_threshold,
         ))
 
-    best_score  = min(fs.eye_score for fs in face_scores)
     has_blinker = any(fs.blinking for fs in face_scores)
+
+    # ── Base score: min() or prominence-weighted average (Feature 4) ──────────
+    if use_face_weighting and frame is not None:
+        h, w    = frame.shape[:2]
+        weights = [face_prominence_weight(f, w, h) for f in faces]
+        total_w = sum(weights)
+        base_score = (
+            sum(fs.eye_score * wt for fs, wt in zip(face_scores, weights)) / total_w
+            if total_w > 1e-9
+            else min(fs.eye_score for fs in face_scores)
+        )
+    else:
+        base_score = min(fs.eye_score for fs in face_scores)  # original behaviour
+
+    # ── Sub-scores (Feature 2) ────────────────────────────────────────────────
+    blur_score = compute_blur_score(frame) if frame is not None else 0.0
+    pose_score = float(np.mean([_face_pose_score(f) for f in faces]))
+
+    composite_score = (
+        COMPOSITE_WEIGHT_EYE  * base_score
+        + COMPOSITE_WEIGHT_BLUR * blur_score
+        + COMPOSITE_WEIGHT_POSE * pose_score
+    )
+
+    final_score = composite_score if use_composite else base_score
 
     return FrameScore(
         face_scores=face_scores,
-        score=best_score,
+        score=final_score,
         has_blinker=has_blinker,
+        blur_score=blur_score,
+        pose_score=pose_score,
+        composite_score=composite_score,
     )
 
 
