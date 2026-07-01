@@ -23,6 +23,7 @@ from collections import deque
 from pathlib import Path
 
 import cv2
+import numpy as np
 from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import ttk
@@ -32,16 +33,22 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import src.config as _cfg
 from src.capture import FrameBuffer
 from src.detector import FaceDetector
-from src.scoring import score_faces
+from src.scoring import score_faces, eye_aspect_ratio
 from src.main import ScoredFrame, _write_frame, _save_best
 from src.overlay import (
     draw_score_hud, draw_face_labels, draw_readiness_bar,
     draw_mode_badge, draw_post_trigger, draw_flash, draw_footer,
     GREEN, ORANGE,
 )
+from src.calibration import (
+    load_calibration, calibration_blink_threshold,
+    compute_calibration_from_samples, save_calibration,
+)
+from src.feedback import log_decision, compute_adjusted_threshold
 
-_POLL_MS  = 33          # target interval between frame updates (~30 fps)
-_THUMB_WH = (220, 165)  # max thumbnail dimensions
+_POLL_MS      = 33          # target interval between frame updates (~30 fps)
+_THUMB_WH     = (220, 165)  # max thumbnail dimensions
+_CALIB_SECS   = 4.0         # open-eye collection window for inline calibration
 
 # Tk label colours (CSS hex, not BGR)
 _HEX_GREEN  = "#1ec81e"
@@ -75,9 +82,33 @@ class SnapperGUI:
         self._running:       bool  = True
         self._thumb_ref             = None   # keep ImageTk reference alive
 
+        # ── Calibration state ─────────────────────────────────────────────────
+        self._calibrating:   bool        = False
+        self._calib_samples: list[float] = []
+        self._calib_start:   float       = 0.0
+
+        # ── Feedback state ────────────────────────────────────────────────────
+        self._last_snap_score: float = 0.0
+
+        # ── Load per-user calibration (falls back to config default) ──────────
+        _calib = load_calibration(_cfg.CALIBRATION_FILE)
+        _blink_default = (
+            calibration_blink_threshold(_calib) if _calib else _cfg.BLINK_THRESHOLD
+        )
+
+        # ── Load adaptive threshold (falls back to config default) ────────────
+        _auto_default = _cfg.AUTO_SNAP_THRESHOLD
+        if _cfg.ENABLE_ADAPTIVE_LEARNING:
+            _auto_default = compute_adjusted_threshold(
+                _cfg.ADAPTIVE_LEARNING_FILE,
+                _cfg.AUTO_SNAP_THRESHOLD,
+                _cfg.ADAPTIVE_LEARNING_WINDOW,
+                _cfg.ADAPTIVE_LEARNING_STEP,
+            )
+
         # ── Live-control Tk variables (sliders / checkboxes drive these) ──────
-        self._vblink = tk.DoubleVar(value=_cfg.BLINK_THRESHOLD)
-        self._vauto  = tk.DoubleVar(value=_cfg.AUTO_SNAP_THRESHOLD)
+        self._vblink = tk.DoubleVar(value=_blink_default)
+        self._vauto  = tk.DoubleVar(value=_auto_default)
         self._vcd    = tk.DoubleVar(value=_cfg.AUTO_SNAP_COOLDOWN)
         self._vpost  = tk.DoubleVar(value=_cfg.POST_TRIGGER_SECONDS)
         self._vmouth = tk.BooleanVar(value=_cfg.ENABLE_MOUTH_PENALTY)
@@ -152,6 +183,13 @@ class SnapperGUI:
                         text="Mouth penalty  (penalise mid-speech frames)",
                         variable=self._vmouth).pack(anchor="w", padx=6, pady=2)
 
+        # ── Calibration button (Feature 1) ────────────────────────────────────
+        self._calib_btn = ttk.Button(
+            cf, text="Calibrate  (set personal EAR baseline)",
+            command=self._start_calibration,
+        )
+        self._calib_btn.pack(padx=6, pady=(4, 2), fill="x")
+
         ttk.Separator(cf).pack(fill="x", pady=5)
 
         # ── Last-saved gallery ────────────────────────────────────────────────
@@ -179,6 +217,16 @@ class SnapperGUI:
 
         ttk.Button(cf, text="Open output folder",
                    command=self._open_folder).pack(padx=6, pady=(3, 0), fill="x")
+
+        # ── Keep / Discard buttons (Feature 3) — hidden until a snap is saved ─
+        self._feedback_frame = ttk.Frame(cf)
+        ttk.Label(self._feedback_frame,
+                  text="Rate last snap:", font=("Helvetica", 8)).pack(side="left", padx=(0, 4))
+        ttk.Button(self._feedback_frame, text="✓ Keep",
+                   command=lambda: self._feedback(True), width=8).pack(side="left", padx=(0, 2))
+        ttk.Button(self._feedback_frame, text="✗ Discard",
+                   command=lambda: self._feedback(False), width=8).pack(side="left")
+        # starts hidden; shown by _on_save when ENABLE_ADAPTIVE_LEARNING=True
 
         ttk.Separator(cf).pack(fill="x", pady=5)
 
@@ -232,6 +280,14 @@ class SnapperGUI:
             self.root.after(_POLL_MS, self._update_frame)
             return
 
+        now = time.monotonic()
+
+        # ── Calibration mode: delegate to dedicated tick ──────────────────────
+        if self._calibrating:
+            self._run_calibration_tick(frame, now)
+            self.root.after(_POLL_MS, self._update_frame)
+            return
+
         # Read live control values once per frame
         blink_thr = self._vblink.get()
         auto_thr  = self._vauto.get()
@@ -240,16 +296,20 @@ class SnapperGUI:
         mouth_pen = self._vmouth.get()
         auto_mode = self._vamode.get()
 
-        # Detect + score (passes live slider values through)
+        # Detect + score (passes live slider values and composite/weighting flags)
         faces  = self._det.detect(frame)
-        result = score_faces(faces,
-                             blink_threshold=blink_thr,
-                             enable_mouth_penalty=mouth_pen)
+        result = score_faces(
+            faces,
+            blink_threshold=blink_thr,
+            enable_mouth_penalty=mouth_pen,
+            frame=frame,
+            use_composite=_cfg.USE_COMPOSITE_SCORING,
+            use_face_weighting=_cfg.USE_FACE_WEIGHTING,
+        )
 
         self._scored_buf.append(ScoredFrame(score=result.score, frame=frame.copy()))
         self._score_hist.append(result.score)
         self._frames += 1
-        now = time.monotonic()
 
         # ── Post-trigger deadline ─────────────────────────────────────────────
         if 0 < self._post_until <= now:
@@ -344,10 +404,14 @@ class SnapperGUI:
         self._flash_clr   = GREEN if success else ORANGE
         self._flash_until = time.monotonic() + _cfg.FLASH_SECONDS
         if success:
-            self._snaps      += 1
-            self._best_saved  = max(self._best_saved, score)
+            self._snaps           += 1
+            self._best_saved       = max(self._best_saved, score)
+            self._last_snap_score  = score
             print(msg)
             self._update_thumbnail(score)
+            # Show Keep/Discard buttons when adaptive learning is enabled
+            if _cfg.ENABLE_ADAPTIVE_LEARNING:
+                self._feedback_frame.pack(padx=6, pady=(2, 0), fill="x")
 
     def _update_thumbnail(self, score: float) -> None:
         """Load the most recently saved JPEG and show it in the gallery."""
@@ -366,6 +430,87 @@ class SnapperGUI:
             self._thumb_score.configure(text=f"Score: {score:.3f}", foreground=hex_s)
         except Exception:
             pass
+
+    # ── Calibration helpers (Feature 1) ───────────────────────────────────────
+
+    def _start_calibration(self) -> None:
+        """Begin the inline 4-second open-eye calibration capture."""
+        self._calibrating    = True
+        self._calib_samples  = []
+        self._calib_start    = time.monotonic()
+        self._calib_btn.configure(state="disabled", text="Calibrating…")
+
+    def _run_calibration_tick(self, frame: np.ndarray, now: float) -> None:
+        """Called from _update_frame() during calibration instead of normal flow."""
+        elapsed   = now - self._calib_start
+        remaining = _CALIB_SECS - elapsed
+
+        # Collect EAR samples
+        faces = self._det.detect(frame)
+        if remaining > 0 and faces:
+            for face in faces:
+                r   = eye_aspect_ratio(face.right_eye_pts)
+                l   = eye_aspect_ratio(face.left_eye_pts)
+                self._calib_samples.append((r + l) * 0.5)
+
+        # Draw calibration overlay
+        vis   = frame.copy()
+        h, w  = vis.shape[:2]
+        if remaining > 0:
+            msg = f"Calibrating — keep eyes open  ({remaining:.1f}s)"
+            clr = (200, 200, 0)
+        else:
+            msg = "Done!  Saving…"
+            clr = (0, 220, 0)
+        cv2.putText(vis, msg, (10, 44),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, clr, 2, cv2.LINE_AA)
+        if not faces:
+            cv2.putText(vis, "No face detected — look at camera",
+                        (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                        (0, 100, 255), 1, cv2.LINE_AA)
+        else:
+            avg = self._calib_samples[-1] if self._calib_samples else 0.0
+            cv2.putText(vis, f"EAR: {avg:.3f}  samples: {len(self._calib_samples)}",
+                        (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                        (255, 255, 255), 1, cv2.LINE_AA)
+
+        rgb   = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+        photo = ImageTk.PhotoImage(image=Image.fromarray(rgb))
+        self._vid_lbl.configure(image=photo)
+        self._vid_lbl.image = photo
+
+        if elapsed >= _CALIB_SECS:
+            self._finish_calibration()
+
+    def _finish_calibration(self) -> None:
+        """Compute calibration result, save it, and update the blink slider."""
+        data = compute_calibration_from_samples(self._calib_samples)
+        save_calibration(_cfg.CALIBRATION_FILE, data)
+        new_thr = float(data["blink_threshold"])
+        self._vblink.set(new_thr)
+        self._calibrating = False
+        self._calib_btn.configure(state="normal",
+                                   text="Calibrate  (set personal EAR baseline)")
+        self._flash_msg   = (f"Calibrated!  baseline={data['baseline_ear']:.3f}  "
+                              f"threshold={new_thr:.3f}")
+        self._flash_clr   = GREEN
+        self._flash_until = time.monotonic() + _cfg.FLASH_SECONDS * 2
+
+    # ── Feedback helpers (Feature 3) ──────────────────────────────────────────
+
+    def _feedback(self, kept: bool) -> None:
+        """Log a keep/discard decision and adjust the auto-snap threshold."""
+        log_decision(_cfg.ADAPTIVE_LEARNING_FILE, self._last_snap_score, kept)
+        self._feedback_frame.pack_forget()
+        new_thr = compute_adjusted_threshold(
+            _cfg.ADAPTIVE_LEARNING_FILE,
+            _cfg.AUTO_SNAP_THRESHOLD,
+            _cfg.ADAPTIVE_LEARNING_WINDOW,
+            _cfg.ADAPTIVE_LEARNING_STEP,
+        )
+        if abs(new_thr - self._vauto.get()) > 1e-4:
+            self._vauto.set(new_thr)
+            print(f"[Adaptive] Auto-snap threshold adjusted → {new_thr:.3f}")
 
     def _open_folder(self) -> None:
         """Open the output directory in the system file manager."""

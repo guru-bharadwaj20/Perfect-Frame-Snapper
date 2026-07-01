@@ -248,6 +248,80 @@ GUI sliders for live, per-session adjustments.
 | `FLASH_SECONDS` | `2.0` | How long the save-confirmation banner stays on screen |
 | `SCORE_HISTORY_N` | `90` | Width of the rolling history strip |
 
+### Advanced / opt-in features (all default to OFF)
+
+The constants below are all `False` by default so the app behaves exactly as
+before when you haven't set them.  Enable one or more in `src/config.py` for
+the corresponding upgrade.
+
+#### Feature 1 — Per-user adaptive threshold calibration
+
+| Constant | Default | What it does |
+|---|---|---|
+| `CALIBRATION_FILE` | `calibration.json` | JSON file storing personalised EAR baseline + threshold |
+
+**How to use (CLI):**
+
+```bash
+python -m src.main --calibrate
+```
+
+A 4-second live window guides you to keep your eyes naturally open.
+The tool measures your personal resting EAR, derives a threshold 20 % below
+that baseline, and writes `calibration.json` to the project root.  On every
+future launch the saved threshold is loaded automatically.  Delete the file
+to revert to the static `BLINK_THRESHOLD` default.
+
+**How to use (GUI):** Click the **"Calibrate (set personal EAR baseline)"**
+button in the right panel.  The live video briefly shows a calibration
+overlay, then updates the blink-threshold slider to your personal value.
+
+#### Feature 2 — Composite frame quality scoring
+
+| Constant | Default | What it does |
+|---|---|---|
+| `USE_COMPOSITE_SCORING` | `False` | When `True`, replaces min(EAR) with a weighted blend |
+| `COMPOSITE_WEIGHT_EYE` | `0.5` | Weight for eye/mouth quality |
+| `COMPOSITE_WEIGHT_BLUR` | `0.3` | Weight for Laplacian sharpness score |
+| `COMPOSITE_WEIGHT_POSE` | `0.2` | Weight for head-pose front-facing score |
+| `BLUR_MIN_VARIANCE` | `50.0` | Laplacian variance mapped to blur_score = 0.0 |
+| `BLUR_MAX_VARIANCE` | `500.0` | Laplacian variance mapped to blur_score = 1.0 |
+
+When enabled, `FrameScore.score` becomes
+`0.5 * eye_score + 0.3 * blur_score + 0.2 * pose_score`.
+`FrameScore` now always exposes `.blur_score`, `.pose_score`, and
+`.composite_score` for inspection regardless of this flag.
+
+#### Feature 3 — Adaptive learning from keep/discard feedback
+
+| Constant | Default | What it does |
+|---|---|---|
+| `ENABLE_ADAPTIVE_LEARNING` | `False` | Show Keep / Discard buttons in GUI after each snap |
+| `ADAPTIVE_LEARNING_FILE` | `feedback_log.json` | Append-only decision log |
+| `ADAPTIVE_LEARNING_WINDOW` | `20` | Decisions per adjustment cycle |
+| `ADAPTIVE_LEARNING_STEP` | `0.01` | Threshold delta per cycle |
+
+After each snap the GUI shows **"Keep"** and **"Discard"** buttons.
+Every `ADAPTIVE_LEARNING_WINDOW` decisions the auto-snap threshold slider is
+nudged in memory (never written back to `config.py`):
+
+- Acceptance rate < 50 % → raise threshold (be pickier)
+- Acceptance rate > 80 % → lower threshold (be more relaxed)
+- Otherwise → no change
+
+The adjustment accumulates across sessions via `feedback_log.json`.
+
+#### Feature 4 — Face weighting for multi-face frames
+
+| Constant | Default | What it does |
+|---|---|---|
+| `USE_FACE_WEIGHTING` | `False` | Prominence-weighted average instead of raw min() |
+| `FACE_WEIGHT_SIZE` | `0.6` | Fraction of prominence from relative face size |
+| `FACE_WEIGHT_CENTER` | `0.4` | Fraction from proximity to frame centre |
+
+When enabled, a small or peripheral blinker has proportionally less influence
+on the frame score than the large, centred primary subject.
+
 ---
 
 ## Testing
@@ -255,14 +329,15 @@ GUI sliders for live, per-session adjustments.
 ```bash
 # All tests are headless — no webcam, no display required (except test_webcam.py)
 
-# Unit tests: scoring logic (23 tests)
-python tests/test_scoring.py
+# Core unit tests (unchanged — verify no regressions)
+python tests/test_scoring.py      # 23 tests: EAR/MAR logic
+python tests/test_main.py         # 6 tests: save / buffer logic
+python tests/test_detector.py     # 5 tests: MediaPipe shape contracts
 
-# Unit tests: save / buffer logic (6 tests)
-python tests/test_main.py
-
-# Smoke tests: detector init + shape contracts (5 tests, loads MediaPipe)
-python tests/test_detector.py
+# New feature tests
+python tests/test_calibration.py       # 8 tests: calibration round-trip + logic
+python tests/test_composite_scoring.py # 12 tests: blur/pose/weighting
+python tests/test_feedback.py          # 12 tests: adaptive learning heuristic
 
 # Integration test: opens the webcam and captures 30 frames
 python tests/test_webcam.py
@@ -274,27 +349,113 @@ python src/scoring.py     # EAR scores + blink state
 
 ---
 
+## Evaluation / benchmarking (Feature 5)
+
+`tests/evaluate.py` measures how well the algorithm's auto-selected frame
+matches a human-labelled ground truth.
+
+### Dataset layout
+
+```
+tests/eval_data/
+    labels.json          <- ground-truth file
+    clip_001/            <- one folder per recorded clip
+        frame_0001.jpg
+        frame_0002.jpg
+        ...
+    clip_002/
+        ...
+```
+
+### labels.json format
+
+```json
+[
+  {
+    "clip":       "clip_001",
+    "best_frame": 47,
+    "note":       "optional description"
+  }
+]
+```
+
+`best_frame` is **1-based** (first image in the sorted folder = frame 1).
+
+### Adding a clip
+
+```bash
+# Extract frames from a video (e.g. at 30 fps)
+ffmpeg -i my_video.mp4 tests/eval_data/clip_002/frame_%04d.jpg
+
+# Watch the clip, pick the best frame, add to labels.json
+# { "clip": "clip_002", "best_frame": 53 }
+```
+
+### Running the evaluation
+
+```bash
+python tests/evaluate.py                          # default data directory
+python tests/evaluate.py --data tests/eval_data   # explicit path
+python tests/evaluate.py --tol 15                 # stricter near-match tolerance
+python tests/evaluate.py --composite              # evaluate with composite scoring on
+python tests/evaluate.py --face-weighting         # evaluate with face weighting on
+```
+
+**Output:**
+
+```
+Evaluating 2 clip(s) from tests/eval_data
+  Tolerance  : +/-30 frames for near-match
+  Composite  : OFF
+  Weighting  : OFF
+
+  clip_001               gt=  47  algo=  47  score=0.312  fps=  68.1  [EXACT]
+  clip_002               gt=  53  algo=  58  score=0.298  fps=  65.7  [NEAR  (+/-5)]
+
+==============================================================
+Results over 2 clip(s):
+  Exact match rate   : 1/2 = 50.0%
+  Near match rate    : 2/2 = 100.0%  (tol=30 frames)
+  Mean frame distance: 2.5 frames
+  Mean score chosen  : 0.305
+  Mean scoring FPS   : 66.9 fps
+==============================================================
+```
+
+---
+
 ## Project structure
 
 ```
 perfect-frame-snapper/
-├── run.py              ← one-command launcher: python run.py
+├── run.py                  <- one-command launcher: python run.py
 ├── requirements.txt
+├── calibration.json        <- created by --calibrate; delete to reset (gitignored)
+├── feedback_log.json       <- adaptive learning log; delete to reset (gitignored)
 ├── src/
-│   ├── config.py       ← all tunables — change here for persistent effect
-│   ├── capture.py      ← webcam loop + rolling frame buffer
-│   ├── detector.py     ← MediaPipe Face Landmarker wrapper → list[FaceResult]
-│   ├── scoring.py      ← EAR + MAR scoring → FrameScore
-│   ├── overlay.py      ← OpenCV drawing helpers (shared by main + gui)
-│   ├── main.py         ← headless CLI orchestrator
-│   └── gui.py          ← Tkinter GUI (live sliders, thumbnail gallery)
-├── models/             ← face_landmarker.task (~10 MB, downloaded on first run)
-├── output/             ← saved snap_YYYYMMDD_HHMMSS.jpg files
+│   ├── config.py           <- all tunables — change here for persistent effect
+│   ├── capture.py          <- webcam loop + rolling frame buffer
+│   ├── detector.py         <- MediaPipe Face Landmarker wrapper -> list[FaceResult]
+│   ├── scoring.py          <- EAR + MAR + blur + pose scoring -> FrameScore
+│   ├── overlay.py          <- OpenCV drawing helpers (shared by main + gui)
+│   ├── main.py             <- headless CLI orchestrator  (--calibrate flag)
+│   ├── gui.py              <- Tkinter GUI (Calibrate button, Keep/Discard buttons)
+│   ├── calibration.py      <- Feature 1: per-user EAR calibration
+│   └── feedback.py         <- Feature 3: adaptive threshold from keep/discard log
+├── models/                 <- face_landmarker.task (~10 MB, downloaded on first run)
+├── output/                 <- saved snap_YYYYMMDD_HHMMSS.jpg files
 └── tests/
     ├── test_webcam.py
     ├── test_detector.py
     ├── test_scoring.py
-    └── test_main.py
+    ├── test_main.py
+    ├── test_calibration.py      <- Feature 1 tests
+    ├── test_composite_scoring.py <- Features 2 & 4 tests
+    ├── test_feedback.py         <- Feature 3 tests
+    ├── evaluate.py              <- Feature 5: benchmarking script
+    └── eval_data/
+        ├── labels.json          <- ground-truth labels (add your clips here)
+        └── clip_001/            <- sample placeholder clip
 ```
 
 ---
