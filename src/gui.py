@@ -464,6 +464,10 @@ class SnapperGUI:
             clr = (0, 220, 0)
         cv2.putText(vis, msg, (10, 44),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.85, clr, 2, cv2.LINE_AA)
+        cv2.putText(vis,
+                    "Look at the camera - blink naturally only AFTER this phase",
+                    (10, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                    (160, 160, 160), 1, cv2.LINE_AA)
         if not faces:
             cv2.putText(vis, "No face detected — look at camera",
                         (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.65,

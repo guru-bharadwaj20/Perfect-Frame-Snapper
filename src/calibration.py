@@ -54,7 +54,7 @@ def run_calibration(detector, camera_index: int = 0) -> dict:
     ear_samples: list[float] = []
     start = time.monotonic()
 
-    print(f"\n[Calibration] Keep eyes NATURALLY OPEN for {_OPEN_EYE_SECONDS:.0f} s …")
+    print(f"\n[Calibration] Keep eyes NATURALLY OPEN for {_OPEN_EYE_SECONDS:.0f} s ...")
     try:
         while True:
             ok, frame = buf.read_frame()
@@ -118,7 +118,7 @@ def _compute_calibration(ear_samples: list[float]) -> dict:
     from src.config import BLINK_THRESHOLD
 
     if len(ear_samples) < _MIN_SAMPLES:
-        print(f"[Calibration] Too few samples ({len(ear_samples)}) — using config default.")
+        print(f"[Calibration] Too few samples ({len(ear_samples)}) - using config default.")
         return {
             "baseline_ear":    round(float(BLINK_THRESHOLD) / _THRESHOLD_FRACTION, 4),
             "blink_threshold": float(BLINK_THRESHOLD),
