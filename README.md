@@ -1,182 +1,232 @@
 # Perfect-Frame Auto-Snapper
 
+**Buffers the last few seconds of webcam footage and saves the one frame where everyone has their eyes open and nobody is mid-word.**
+
+[![Python](https://img.shields.io/badge/Python-3.9–3.13-3776AB?logo=python&logoColor=white)](requirements.txt)
+[![MediaPipe](https://img.shields.io/badge/MediaPipe-478_landmarks-0097A7)](src/detector.py)
+[![OpenCV](https://img.shields.io/badge/OpenCV-4.13-5C3EE8?logo=opencv&logoColor=white)](src/capture.py)
+[![Tests](https://img.shields.io/badge/tests-67_passing-brightgreen)](tests)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+No manual timing and no sifting through a burst of near-identical shots. Every
+frame is scored as it arrives; when you press SPACE — or when auto-snap sees a
+sustained good moment — the tool reaches back through its buffer and keeps the
+best one.
+
 ![Demo](Demo.png)
-
-[![Python](https://img.shields.io/badge/python-3.9%E2%80%933.13-blue)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-67%20passing-brightgreen)](tests)
-
-Continuously buffers the last few seconds of webcam footage and retroactively
-saves the **single best frame** — the one where everyone in shot has their
-eyes fully open and nobody is mid-blink or mid-word. No manual timing, no
-sifting through a burst of near-identical shots. One great photo, automatically.
 
 ---
 
-## Features
+## Contents
 
-- **Real-time face scoring** via MediaPipe's 478-point Face Landmarker
-- **Blink detection** using Eye Aspect Ratio (EAR), with an optional Mouth
-  Aspect Ratio (MAR) penalty for mid-speech frames
-- **Manual mode** — press SPACE and the tool reaches back through its buffer
-  to save the best recent frame (with an optional post-trigger window)
-- **Auto-snap mode** — watches continuously and saves the instant it sees a
-  sustained, high-quality moment
-- **Per-user calibration** for a personalized blink threshold
-- **Composite quality scoring** (blur + head pose + eye/mouth) and
-  **face-weighting** for multi-person shots — both opt-in
-- **Adaptive learning** from Keep/Discard feedback to self-tune the auto-snap
-  threshold over time
-- A lightweight **Tkinter GUI** with live sliders, plus a headless CLI
+| Section | |
+|---|---|
+| [What it does](#what-it-does) | The feature surface, by area |
+| [Architecture](#architecture) | Capture, detect, score, buffer, save |
+| [How a snap happens](#how-a-snap-happens) | Manual and auto-snap |
+| [Quick start](#quick-start) | Install, GUI, CLI, controls |
+| [Configuration](#configuration) | The tunables, and the opt-in features |
+| [Project status](#project-status) | Tests, evaluation, packaging |
+| [Design decisions](#design-decisions) | The tradeoffs, and why |
+| [Repository layout](#repository-layout) | Where things live |
+| [Team](#team) | Who built it |
+
+---
+
+## What it does
+
+| Area | Capabilities |
+|---|---|
+| **Face scoring** | MediaPipe's 478-point Face Landmarker on every frame |
+| **Blink detection** | Eye Aspect Ratio (EAR), with an optional Mouth Aspect Ratio (MAR) penalty for mid-speech frames |
+| **Manual mode** | SPACE reaches back through the buffer, with an optional post-trigger window |
+| **Auto-snap** | Saves the instant it sees a sustained run of high-quality frames, with a cooldown |
+| **Calibration** | Measures your resting EAR for a personal blink threshold |
+| **Composite scoring** | Blur and head pose blended with eye/mouth (opt-in) |
+| **Face weighting** | Weights each face by size and centring for group shots (opt-in) |
+| **Adaptive learning** | Keep/Discard feedback nudges the auto-snap threshold over time (opt-in) |
+| **Interfaces** | A Tkinter GUI with live sliders, and a headless CLI |
+
+---
+
+## Architecture
+
+```mermaid
+graph LR
+    CAM["Webcam"] --> CAP["capture.py<br/>loop + rolling buffer (~3 s)"]
+    CAP --> DET["detector.py<br/>MediaPipe → FaceResult[]"]
+    DET --> SCO["scoring.py<br/>EAR · MAR · blur · pose → FrameScore"]
+    SCO --> BUF[("buffer<br/>frame + score")]
+    BUF --> PICK{"snap?<br/>SPACE or auto"}
+    PICK --> OUT["output/<br/>best frame"]
+    CFG["config.py<br/>all tunables"] -.-> SCO
+    CFG -.-> CAP
+    GUI["gui.py · main.py<br/>Tkinter GUI · headless CLI"] --> CAP
+    OV["overlay.py"] -.-> GUI
+```
+
+---
+
+## How a snap happens
+
+```mermaid
+sequenceDiagram
+    participant W as Webcam
+    participant D as Detector
+    participant S as Scorer
+    participant B as Buffer
+    participant U as You
+
+    loop every frame
+        W->>D: frame
+        D->>S: faces + landmarks
+        S->>S: per face: EAR (− MAR penalty)
+        S->>B: frame score = minimum over faces
+    end
+    alt manual
+        U->>B: SPACE
+        B->>B: keep filling for POST_TRIGGER_SECONDS
+    else auto-snap
+        B->>B: AUTO_SNAP_STABLE_FRAMES above the threshold, outside the cooldown
+    end
+    B->>U: highest-scoring frame in the window → output/
+```
+
+The frame's score is the **minimum across faces**: one blinker tanks the whole
+frame.
 
 ---
 
 ## Quick start
 
 ```bash
-# 1. Create and activate a virtual environment
+# 1 — environment
 python -m venv venv
-venv\Scripts\activate          # Windows
-# source venv/bin/activate     # macOS / Linux
-
-# 2. Install dependencies
+venv\Scripts\activate              # Windows · source venv/bin/activate on macOS/Linux
 pip install -r requirements.txt
 
-# 3. Launch the GUI (recommended)
+# 2 — the GUI (recommended), or the headless CLI
 python run.py
-
-# 4. Or run the headless CLI
 python -m src.main
+python -m src.main --calibrate     # personal blink threshold → calibration.json
 ```
 
-On first run, the MediaPipe Face Landmarker model (~10 MB) downloads
-automatically to `models/` and is cached for every future session.
-
----
-
-## How it works
-
-Each webcam frame is passed through MediaPipe to detect faces and their
-landmarks. For every detected face, eye-openness (EAR) and, optionally, mouth
-openness (MAR) are combined into a per-face score; the frame's overall score
-is the **minimum across all faces** — one blinker tanks the whole frame. Frames
-are held in a rolling buffer (default ~3 s), and when you trigger a snap
-(manually or automatically), the highest-scoring frame in that window is
-saved to `output/`.
-
-| Mode | Behavior |
-|---|---|
-| **Manual** (default) | Press **SPACE** to fire the shutter. The buffer keeps filling briefly afterward (`POST_TRIGGER_SECONDS`), then the best frame in the whole window is saved. |
-| **Auto-snap** (toggle with **A**) | Saves automatically once a sustained run of high-quality frames (`AUTO_SNAP_STABLE_FRAMES`) clears `AUTO_SNAP_THRESHOLD`, subject to a cooldown to avoid duplicate saves. |
-
-### Module structure
-
-```
-src/config.py     all tunables — change here for persistent effect
-src/capture.py    webcam loop + rolling frame buffer
-src/detector.py   MediaPipe wrapper -> list[FaceResult]
-src/scoring.py    EAR / MAR / blur / pose scoring -> FrameScore
-src/overlay.py    shared OpenCV drawing helpers
-src/main.py       headless CLI orchestrator
-src/gui.py        Tkinter GUI
-```
-
----
-
-## Controls
+The Face Landmarker model (~10 MB) downloads to `models/` on first run and is
+cached after that.
 
 | Key | Action |
 |---|---|
 | **SPACE** | Fire a manual snap |
-| **A** | Toggle auto-snap mode |
+| **A** | Toggle auto-snap |
 | **Q** / **ESC** | Quit and print a session summary |
 
-The GUI mirrors these controls with buttons and adds live sliders for every
-threshold, a Calibrate button, and a thumbnail preview of the last saved shot.
+The GUI mirrors these with buttons, live sliders for every threshold, a
+Calibrate button and a thumbnail of the last saved shot.
 
 ---
 
 ## Configuration
 
-All tunables live in `src/config.py`; GUI sliders adjust the same values live,
-per session. The most commonly changed settings:
+All tunables live in [`src/config.py`](src/config.py); GUI sliders change the
+same values for the session.
 
 | Constant | Default | What it does |
 |---|---|---|
 | `CAMERA_INDEX` | `0` | Webcam index |
-| `BUFFER_SIZE` | `90` | Rolling buffer size in frames (~3 s @ 30 fps) |
+| `BUFFER_SIZE` | `90` | Rolling buffer in frames (~3 s at 30 fps) |
 | `BLINK_THRESHOLD` | `0.20` | EAR below this counts as a blink |
-| `ENABLE_MOUTH_PENALTY` | `True` | Penalize wide-open mouths (mid-speech) |
+| `ENABLE_MOUTH_PENALTY` | `True` | Penalise wide-open mouths |
 | `POST_TRIGGER_SECONDS` | `1.0` | Extra buffering after SPACE (`0` = pure pre-trigger) |
 | `AUTO_SNAP_THRESHOLD` | `0.26` | Minimum score for an auto-snap candidate |
-| `AUTO_SNAP_STABLE_FRAMES` | `8` | Consecutive good frames before auto-firing |
+| `AUTO_SNAP_STABLE_FRAMES` | `8` | Consecutive good frames before firing |
 | `AUTO_SNAP_COOLDOWN` | `5.0` | Seconds between auto-snaps |
 
-### Opt-in advanced features (all default OFF)
-
-| Feature | Enable via | Summary |
-|---|---|---|
-| **Adaptive calibration** | `python -m src.main --calibrate` or the GUI Calibrate button | Measures your personal resting EAR and derives a custom blink threshold, saved to `calibration.json` |
-| **Composite scoring** | `USE_COMPOSITE_SCORING = True` | Blends eye/mouth score with blur (sharpness) and head-pose (front-facing) scores |
-| **Adaptive learning** | `ENABLE_ADAPTIVE_LEARNING = True` | Keep/Discard buttons in the GUI nudge the auto-snap threshold based on your feedback over time |
-| **Face weighting** | `USE_FACE_WEIGHTING = True` | Weights each face's contribution by size and centering, so a small background blinker doesn't ruin the shot |
+| Opt-in feature (default off) | Enable via |
+|---|---|
+| Composite scoring | `USE_COMPOSITE_SCORING = True` |
+| Adaptive learning | `ENABLE_ADAPTIVE_LEARNING = True` |
+| Face weighting | `USE_FACE_WEIGHTING = True` |
+| Adaptive calibration | `--calibrate` or the GUI button |
 
 ---
 
-## Testing
+## Project status
 
-```bash
-# Core unit tests — no webcam required
-python tests/test_scoring.py
-python tests/test_main.py
-python tests/test_detector.py
+Complete for its scope: 67 tests pass, and a benchmark measures how closely the
+chosen frame matches human labels.
 
-# Feature tests
-python tests/test_calibration.py
-python tests/test_composite_scoring.py
-python tests/test_feedback.py
+| Suite | Needs a webcam |
+|---|:---:|
+| `test_scoring.py` · `test_main.py` · `test_detector.py` | no |
+| `test_calibration.py` · `test_composite_scoring.py` · `test_feedback.py` | no |
+| `test_webcam.py` (integration) | yes |
 
-# Integration test — opens the webcam
-python tests/test_webcam.py
-```
+[`tests/evaluate.py`](tests/evaluate.py) compares the algorithm's pick against a
+human-labelled best frame across recorded clips; the dataset format is in
+[tests/eval_data/README.md](tests/eval_data/README.md).
 
-A benchmarking script (`tests/evaluate.py`) measures how closely the
-algorithm's chosen frame matches a human-labelled ground truth across a set
-of recorded clips — see `tests/eval_data/README.md` for dataset format and
-usage.
-
----
-
-## Packaging as a standalone executable
+**Packaging.** PyInstaller builds a standalone binary (typically 200–400 MB with
+MediaPipe and OpenCV):
 
 ```bash
 pip install pyinstaller
-
 pyinstaller --onefile --windowed \
   --add-data "models/face_landmarker.task;models" \
-  --hidden-import mediapipe \
-  --hidden-import PIL._tkinter_finder \
-  run.py
+  --hidden-import mediapipe --hidden-import PIL._tkinter_finder run.py
 ```
-
-The bundled binary (in `dist/`) is typically 200–400 MB due to MediaPipe and
-OpenCV. Test it on a machine without Python installed before sharing.
 
 ---
 
-## Dependencies
+## Design decisions
 
-| Package | Version | Role |
-|---|---|---|
-| `opencv-python` | 4.13.0.92 | Webcam capture, image I/O, overlay drawing |
-| `mediapipe` | 0.10.35 | Face Landmarker model (478 landmarks, Tasks API) |
-| `numpy` | 2.5.0 | EAR / MAR geometry calculations |
-| `Pillow` | ≥ 9.0 | BGR frame → Tkinter PhotoImage conversion (GUI only) |
+**Retroactive, not predictive.** Instead of guessing when to fire, keep the last
+few seconds and choose afterwards. The post-trigger window catches the moment
+just after you press.
 
-Python 3.9–3.13 supported.
+**Minimum, not average.** A group photo is only as good as its worst face, so
+the frame score is the minimum across faces — unless face weighting is turned on
+for crowds with small background faces.
+
+**Stable runs for auto-snap.** One good frame is noise; a run of
+`AUTO_SNAP_STABLE_FRAMES` above the threshold is a moment. A cooldown stops
+near-duplicate saves.
+
+**Everything advanced is opt-in.** Composite scoring, face weighting and
+adaptive learning change behaviour in ways a user should choose, so the default
+is the simple, explainable EAR/MAR score.
+
+**One config, two interfaces.** The GUI and CLI share `config.py`, so a value
+tuned live in the GUI can be made permanent in one place.
+
+---
+
+## Repository layout
+
+```
+.
+├── src/
+│   ├── config.py      all tunables
+│   ├── capture.py     webcam loop + rolling frame buffer
+│   ├── detector.py    MediaPipe wrapper → FaceResult[]
+│   ├── scoring.py     EAR / MAR / blur / pose → FrameScore
+│   ├── overlay.py     OpenCV drawing helpers
+│   ├── main.py        headless CLI
+│   └── gui.py         Tkinter GUI
+├── tests/             unit, feature and webcam tests, evaluate.py, eval_data/
+├── output/            saved frames
+└── run.py             GUI entry point
+```
+
+---
+
+## Team
+
+| Member | Focus |
+|---|---|
+| **Guru R Bharadwaj** | Scoring, buffering, auto-snap, GUI and evaluation |
 
 ---
 
 ## License
 
-Released under the [MIT License](LICENSE).
+[MIT](LICENSE).
