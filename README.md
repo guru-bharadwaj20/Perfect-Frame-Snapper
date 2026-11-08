@@ -1,5 +1,13 @@
 # Perfect-Frame Auto-Snapper
 
+<p align="center">
+  <a href="Perfect-Frame-Snapper%20Demo.mp4">
+    <img src="Perfect-Frame-Snapper%20Demo%20thumbnail.png" alt="Watch the Perfect-Frame-Snapper demo video" width="720">
+  </a>
+  <br>
+  <sub>▶ <b><a href="Perfect-Frame-Snapper%20Demo.mp4">Watch the Perfect-Frame-Snapper demo</a></b> (74 s): the phase plan and commits, the README quick start on a fresh clone, then the GUI scoring a recorded NASA clip live: SPACE, auto-snap, calibration and the CLI</sub>
+</p>
+
 **Buffers the last few seconds of webcam footage and saves the one frame where everyone has their eyes open and nobody is mid-word.**
 
 [![Python](https://img.shields.io/badge/Python-3.9–3.13-3776AB?logo=python&logoColor=white)](requirements.txt)
